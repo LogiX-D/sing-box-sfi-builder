@@ -15,8 +15,17 @@ permissions:
   contents: write
 
 jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "GitHub Actions runner scheduling is active"
+
   build-ipa:
-    runs-on: macos-26
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-26-intel]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
       - name: Checkout builder repo
@@ -26,11 +35,12 @@ jobs:
         run: |
           set -euo pipefail
           ls -d /Applications/Xcode*.app || true
-          XCODE_26=$(ls -d /Applications/Xcode_26*.app /Applications/Xcode-26*.app /Applications/Xcode.app 2>/dev/null | head -n 1 || true)
+          XCODE_26=""
           for cand in $(ls -d /Applications/Xcode_26*.app /Applications/Xcode-26*.app 2>/dev/null | sort -V); do
             XCODE_26="$cand"
           done
           if [ -n "$XCODE_26" ] && [ -d "$XCODE_26/Contents/Developer" ]; then
+            echo "Switching active Xcode to $XCODE_26"
             sudo xcode-select -s "$XCODE_26/Contents/Developer"
           fi
           xcodebuild -version
@@ -98,24 +108,14 @@ jobs:
         run: |
           set -euo pipefail
           cd sing-box-for-apple
-          echo "=== Original AppConfiguration.swift ==="
-          cat Library/Shared/AppConfiguration.swift || true
-          echo "=== Original FilePath.swift ==="
-          cat Library/Shared/FilePath.swift || true
-          echo "=== Searching AppConfiguration & providerBundleIdentifier references ==="
-          grep -rn "AppConfiguration\|providerBundleIdentifier" Library/ ApplicationLibrary/ SFI/ Extension/ || true
-
           python3 - <<'PY'
           from pathlib import Path
-          import re
 
-          filepath_swift = Path("Library/Shared/FilePath.swift")
-          orig_fp = filepath_swift.read_text(encoding="utf-8")
+          app_cfg = Path("Library/Shared/AppConfiguration.swift")
+          new_app_cfg = '''import Foundation
 
-          resolver_code = '''import Foundation
-
-          public enum ResignRuntimeResolver {
-              public static let resolvedPackageName: String = {
+          public enum AppConfiguration {
+              public static let packageName: String = {
                   let mainURL = Bundle.main.bundleURL
                   if mainURL.pathExtension == "appex" {
                       let hostAppURL = mainURL.deletingLastPathComponent().deletingLastPathComponent()
@@ -132,18 +132,10 @@ jobs:
                   if let mainID = Bundle.main.bundleIdentifier, !mainID.isEmpty {
                       return mainID
                   }
-                  return (Bundle.main.infoDictionary?["BasePackageIdentifier"] as? String) ?? "io.nekohasekai.sfavt"
-              }()
-
-              public static let resolvedExtensionBundleID: String = {
-                  if let pluginsURL = Bundle.main.builtInPlugInsURL {
-                      let extURL = pluginsURL.appendingPathComponent("Extension.appex", isDirectory: true)
-                      if let extBundle = Bundle(url: extURL),
-                         let extID = extBundle.bundleIdentifier, !extID.isEmpty {
-                          return extID
-                      }
+                  if let value = Bundle.main.object(forInfoDictionaryKey: "BasePackageIdentifier") as? String, !value.isEmpty {
+                      return value
                   }
-                  return "\\(resolvedPackageName).extension"
+                  return "io.nekohasekai.sfavt"
               }()
 
               private static func provisionedAppGroups() -> [String] {
@@ -173,59 +165,110 @@ jobs:
                   return []
               }
 
-              public static let resolvedAppGroupID: String = {
+              public static let appGroupID: String = {
                   var candidates: [String] = []
                   for group in provisionedAppGroups() {
                       if group.contains("*") {
-                          candidates.append(group.replacingOccurrences(of: "*", with: resolvedPackageName))
+                          candidates.append(group.replacingOccurrences(of: "*", with: packageName))
                       } else {
                           candidates.append(group)
                       }
                   }
-                  candidates.append("group.\\(resolvedPackageName)")
-                  if let infoGroup = Bundle.main.infoDictionary?["AppGroupIdentifier"] as? String, !infoGroup.isEmpty {
-                      candidates.append(infoGroup)
+                  candidates.append("group.\\(packageName)")
+                  if let value = Bundle.main.object(forInfoDictionaryKey: "AppGroupIdentifier") as? String, !value.isEmpty {
+                      candidates.append(value)
                   }
                   var seen = Set<String>()
-                  for candidate in candidates where !candidate.isEmpty {
+                  for candidate in candidates where candidate.contains(".") {
                       if seen.insert(candidate).inserted {
                           if FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: candidate) != nil {
                               return candidate
                           }
                       }
                   }
-                  return candidates.first ?? "group.\\(resolvedPackageName)"
+                  return candidates.first(where: { $0.contains(".") }) ?? "group.\\(packageName)"
               }()
+
+              public static var teamID: String {
+                  guard let dotIndex = appGroupID.firstIndex(of: ".") else {
+                      return "group"
+                  }
+                  return String(appGroupID[..<dotIndex])
+              }
+
+              public static var extensionBundleID: String {
+                  if Bundle.main.bundleURL.lastPathComponent == "Extension.appex",
+                     let selfID = Bundle.main.bundleIdentifier, !selfID.isEmpty {
+                      return selfID
+                  }
+                  if let pluginsURL = Bundle.main.builtInPlugInsURL {
+                      let extURL = pluginsURL.appendingPathComponent("Extension.appex", isDirectory: true)
+                      if let extBundle = Bundle(url: extURL),
+                         let extID = extBundle.bundleIdentifier, !extID.isEmpty {
+                          return extID
+                      }
+                  }
+                  return "\\(packageName).extension"
+              }
+
+              public static var systemExtensionBundleID: String {
+                  "\\(packageName).system"
+              }
+
+              #if os(macOS)
+                  public static var systemExtensionMachServiceName: String {
+                      "\\(appGroupID).system.\\(Bundle.main.version)"
+                  }
+              #endif
+
+              public static var packetTunnelBundleIDs: [String] {
+                  if extensionBundleID == systemExtensionBundleID {
+                      return [extensionBundleID]
+                  }
+                  return [extensionBundleID, systemExtensionBundleID]
+              }
+
+              public static var fileProviderDomainID: String {
+                  "\\(packageName).workingdir"
+              }
+
+              public static var widgetControlKind: String {
+                  "\\(packageName).widget.ServiceToggle"
+              }
+
+              public static var profileUTType: String {
+                  "\\(packageName).profile"
+              }
+
+              public static var backgroundTaskID: String {
+                  "\\(packageName).update_profiles"
+              }
+
+              public static var iCloudContainerID: String {
+                  "iCloud.\\(packageName)"
+              }
+
+              #if os(macOS) || JAILBREAK
+                  public static var rootHelperBundleID: String {
+                      "\\(packageName).helper"
+                  }
+
+                  public static var rootHelperMachService: String {
+                      "\\(appGroupID).helper"
+                  }
+              #endif
           }
           '''
+          app_cfg.write_text(new_app_cfg, encoding="utf-8")
 
-          patched_fp = orig_fp.replace("import Foundation", resolver_code, 1)
-          patched_fp = patched_fp.replace(
-              "public static let packageName = AppConfiguration.packageName",
-              "public static let packageName = ResignRuntimeResolver.resolvedPackageName"
-          )
-          patched_fp = patched_fp.replace(
-              "public static let groupName = AppConfiguration.appGroupID",
-              "public static let groupName = ResignRuntimeResolver.resolvedAppGroupID"
-          )
-          patched_fp = patched_fp.replace(
+          filepath_swift = Path("Library/Shared/FilePath.swift")
+          orig_fp = filepath_swift.read_text(encoding="utf-8")
+          patched_fp = orig_fp.replace(
               "FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: groupName)",
               "(FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: groupName) ?? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!)"
           )
           filepath_swift.write_text(patched_fp, encoding="utf-8")
-
-          # Also patch providerBundleIdentifier in Library/ if it hardcodes .extension suffix
-          for swift_file in Path("Library").rglob("*.swift"):
-              txt = swift_file.read_text(encoding="utf-8")
-              if "providerBundleIdentifier" in txt and ".extension\"" in txt:
-                  new_txt = re.sub(
-                      r'"\\?\((?:FilePath\.packageName|AppConfiguration\.packageName)\)\.extension"',
-                      'ResignRuntimeResolver.resolvedExtensionBundleID',
-                      txt
-                  )
-                  if new_txt != txt:
-                      swift_file.write_text(new_txt, encoding="utf-8")
-                      print(f"Patched providerBundleIdentifier in {swift_file}")
+          print("Successfully patched AppConfiguration.swift and FilePath.swift")
           PY
 
       - name: Compile Unsigned SFI Release App
@@ -281,13 +324,11 @@ jobs:
             codesign --force --sign - --timestamp=none "$app_dir"
           }
 
-          # 1. Build Paid-Certificate Resign IPA (Slim: main app + core PacketTunnel Extension.appex only)
           rm -rf work_resign
           mkdir -p work_resign/Payload
           cp -R "$APP_SRC" work_resign/Payload/sing-box.app
           RESIGN_APP="work_resign/Payload/sing-box.app"
 
-          # Remove Extensions/IntentsExtension.appex (breaks ESign/GBox signature verification) and non-VPN PlugIns
           rm -rf "$RESIGN_APP/Extensions"
           if [ -d "$RESIGN_APP/PlugIns" ]; then
             for item in "$RESIGN_APP/PlugIns"/*.appex; do
@@ -297,13 +338,11 @@ jobs:
               fi
             done
           fi
-          # Remove hardcoded upstream iCloud container from Info.plist
           /usr/libexec/PlistBuddy -c "Delete :NSUbiquitousContainers" "$RESIGN_APP/Info.plist" 2>/dev/null || true
 
           adhoc_sign_bundle "$RESIGN_APP"
           (cd work_resign && ditto -c -k --sequesterRsrc --keepParent Payload "../dist/sing-box-${VERSION}-resign.ipa")
 
-          # 2. Build Full IPA (all extensions preserved)
           rm -rf work_full
           mkdir -p work_full/Payload
           cp -R "$APP_SRC" work_full/Payload/sing-box.app
@@ -315,16 +354,16 @@ jobs:
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: sing-box-${{ steps.meta.outputs.version }}-ipa
+          name: sing-box-${{ steps.meta.outputs.version }}-ipa-${{ matrix.runner }}
           path: dist/*.ipa
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: sfi-v${{ steps.meta.outputs.version }}-build.${{ github.run_number }}
-          name: sing-box iOS v${{ steps.meta.outputs.version }} (Paid-Cert Resign Ready)
+          tag_name: sfi-v${{ steps.meta.outputs.version }}-${{ matrix.runner }}-build.${{ github.run_number }}
+          name: sing-box iOS v${{ steps.meta.outputs.version }} (${{ matrix.runner }} Paid-Cert Resign Ready)
           body: |
-            Automated build from official `SagerNet/sing-box` (${{ steps.meta.outputs.tag }}) + `SagerNet/sing-box-for-apple`.
-            - **`sing-box-${{ steps.meta.outputs.version }}-resign.ipa` (Recommended)**: Optimized for 3rd-party paid certificates (ESign 轻松签 / GBox 全能签 / Feather). Keeps core PacketTunnel `Extension.appex`, strips conflicting `IntentsExtension`/`iCloud` containers, and dynamically resolves `AppGroup` & `BundleID` from `embedded.mobileprovision`.
+            Automated build from official `SagerNet/sing-box` (${{ steps.meta.outputs.tag }}) + `SagerNet/sing-box-for-apple` on `${{ matrix.runner }}`.
+            - **`sing-box-${{ steps.meta.outputs.version }}-resign.ipa` (Recommended)**: Optimized for 3rd-party paid certificates (ESign 轻松签 / GBox 全能签 / Feather).
             - **`sing-box-${{ steps.meta.outputs.version }}-full.ipa`**: Full unmodified bundle with all 6 extensions.
           files: dist/*.ipa
