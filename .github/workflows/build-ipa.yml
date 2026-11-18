@@ -282,6 +282,19 @@ jobs:
           )
           filepath_swift.write_text(patched_fp, encoding="utf-8")
           print("Successfully patched AppConfiguration.swift and FilePath.swift")
+
+          import re
+          main_view = Path("SFI/MainView.swift")
+          mv_txt = main_view.read_text(encoding="utf-8")
+          new_mv, count = re.subn(
+              r'\.toolbar\s*\{\s*if remoteControlInToolbar[\s\S]*?ToolbarItem\(placement:\s*\.topBarLeading\)\s*\{\s*serviceToolbarItem\s*\}\s*\}',
+              '.toolbar {\n                    ToolbarItem(placement: .topBarLeading) {\n                        HStack(spacing: 12) {\n                            if remoteControlInToolbar, environments.remoteServer != nil || !remoteServers.isEmpty {\n                                remoteControlPicker\n                            }\n                            serviceToolbarItem\n                        }\n                    }\n                }',
+              mv_txt,
+              count=1
+          )
+          assert count == 1, f"Expected 1 toolbar replacement in SFI/MainView.swift, got {count}"
+          main_view.write_text(new_mv, encoding="utf-8")
+          print("Successfully patched SFI/MainView.swift toolbar")
           PY
 
       - name: Compile Unsigned SFI Release App
