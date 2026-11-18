@@ -58,21 +58,25 @@ jobs:
           git checkout "$TAG"
           cd ..
 
+          APPLE_SHA=$(git -C sing-box ls-tree HEAD clients/apple | awk '{print $3}')
           git clone --filter=blob:none https://github.com/SagerNet/sing-box-for-apple.git sing-box-for-apple
           cd sing-box-for-apple
-          MATCH_COMMIT=$(git log -G"MARKETING_VERSION = ${VERSION};" -n 1 --format="%H" -- sing-box.xcodeproj/project.pbxproj || true)
-          if [ -n "$MATCH_COMMIT" ]; then
-            echo "Matched sing-box-for-apple commit $MATCH_COMMIT for version $VERSION"
-            git checkout "$MATCH_COMMIT"
+          if [ -n "$APPLE_SHA" ]; then
+            echo "Checking out exact clients/apple submodule SHA $APPLE_SHA for $TAG"
+            git fetch origin "$APPLE_SHA" || true
+            git checkout "$APPLE_SHA"
           else
-            echo "No exact MARKETING_VERSION commit match; using default branch HEAD"
+            MATCH_COMMIT=$(git log --grep="^Bump version ${VERSION}$" -n 1 --format="%H" || true)
+            if [ -n "$MATCH_COMMIT" ]; then
+              git checkout "$MATCH_COMMIT"
+            fi
           fi
           git submodule update --init --recursive
           test -f Frameworks/Runestone/Package.swift
 
-      - name: Cache Libbox.xcframework
+      - name: Restore Cached Libbox.xcframework
         id: cache-libbox
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: sing-box-for-apple/Libbox.xcframework
           key: libbox-ios-arm64-${{ steps.meta.outputs.tag }}
@@ -105,6 +109,13 @@ jobs:
           fi
           test -d sing-box-for-apple/Libbox.xcframework
           ls -la sing-box-for-apple/Libbox.xcframework
+
+      - name: Save Libbox.xcframework Cache
+        if: steps.cache-libbox.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: sing-box-for-apple/Libbox.xcframework
+          key: libbox-ios-arm64-${{ steps.meta.outputs.tag }}
 
       - name: Apply Paid-Certificate Runtime AppGroup & BundleID Resolver Patch
         run: |
