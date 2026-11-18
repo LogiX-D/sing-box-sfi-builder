@@ -1,0 +1,330 @@
+name: Build sing-box iOS IPA
+
+on:
+  push:
+    paths:
+      - '.github/workflows/build-ipa.yml'
+  workflow_dispatch:
+    inputs:
+      sing_box_tag:
+        description: 'Optional sing-box tag (leave empty for latest stable release)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build-ipa:
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - name: Checkout builder repo
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 26+
+        run: |
+          set -euo pipefail
+          ls -d /Applications/Xcode*.app || true
+          XCODE_26=$(ls -d /Applications/Xcode_26*.app /Applications/Xcode-26*.app /Applications/Xcode.app 2>/dev/null | head -n 1 || true)
+          for cand in $(ls -d /Applications/Xcode_26*.app /Applications/Xcode-26*.app 2>/dev/null | sort -V); do
+            XCODE_26="$cand"
+          done
+          if [ -n "$XCODE_26" ] && [ -d "$XCODE_26/Contents/Developer" ]; then
+            sudo xcode-select -s "$XCODE_26/Contents/Developer"
+          fi
+          xcodebuild -version
+
+      - name: Clone sing-box (latest stable) and sing-box-for-apple
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.sing_box_tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name)
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building sing-box version: $VERSION ($TAG)"
+
+          git clone --filter=blob:none https://github.com/SagerNet/sing-box.git sing-box
+          cd sing-box
+          git checkout "$TAG"
+          cd ..
+
+          git clone --filter=blob:none https://github.com/SagerNet/sing-box-for-apple.git sing-box-for-apple
+          cd sing-box-for-apple
+          MATCH_COMMIT=$(git log -G"MARKETING_VERSION = ${VERSION};" -n 1 --format="%H" -- sing-box.xcodeproj/project.pbxproj || true)
+          if [ -n "$MATCH_COMMIT" ]; then
+            echo "Matched sing-box-for-apple commit $MATCH_COMMIT for version $VERSION"
+            git checkout "$MATCH_COMMIT"
+          else
+            echo "No exact MARKETING_VERSION commit match; using default branch HEAD"
+          fi
+
+      - name: Setup Go Toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: sing-box/go.mod
+          cache: false
+
+      - name: Build Libbox.xcframework (iOS only for speed, fallback to full apple)
+        run: |
+          set -euo pipefail
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          cd sing-box
+          make lib_install
+          if go run ./cmd/internal/build_libbox -h 2>&1 | grep -q -- "-platform"; then
+            go run ./cmd/internal/build_libbox -target apple -platform ios
+          else
+            make lib_apple
+          fi
+          cd ..
+          if [ ! -d "sing-box-for-apple/Libbox.xcframework" ]; then
+            FOUND_XC=$(find . -maxdepth 3 -name "Libbox.xcframework" -type d | head -n 1 || true)
+            if [ -n "$FOUND_XC" ]; then
+              cp -R "$FOUND_XC" sing-box-for-apple/Libbox.xcframework
+            fi
+          fi
+          test -d sing-box-for-apple/Libbox.xcframework
+          ls -la sing-box-for-apple/Libbox.xcframework
+
+      - name: Apply Paid-Certificate Runtime AppGroup & BundleID Resolver Patch
+        run: |
+          set -euo pipefail
+          cd sing-box-for-apple
+          echo "=== Original AppConfiguration.swift ==="
+          cat Library/Shared/AppConfiguration.swift || true
+          echo "=== Original FilePath.swift ==="
+          cat Library/Shared/FilePath.swift || true
+          echo "=== Searching AppConfiguration & providerBundleIdentifier references ==="
+          grep -rn "AppConfiguration\|providerBundleIdentifier" Library/ ApplicationLibrary/ SFI/ Extension/ || true
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          filepath_swift = Path("Library/Shared/FilePath.swift")
+          orig_fp = filepath_swift.read_text(encoding="utf-8")
+
+          resolver_code = '''import Foundation
+
+          public enum ResignRuntimeResolver {
+              public static let resolvedPackageName: String = {
+                  let mainURL = Bundle.main.bundleURL
+                  if mainURL.pathExtension == "appex" {
+                      let hostAppURL = mainURL.deletingLastPathComponent().deletingLastPathComponent()
+                      if hostAppURL.pathExtension == "app",
+                         let hostBundle = Bundle(url: hostAppURL),
+                         let hostID = hostBundle.bundleIdentifier, !hostID.isEmpty {
+                          return hostID
+                      }
+                      if let extID = Bundle.main.bundleIdentifier,
+                         let dotIndex = extID.lastIndex(of: ".") {
+                          return String(extID[..<dotIndex])
+                      }
+                  }
+                  if let mainID = Bundle.main.bundleIdentifier, !mainID.isEmpty {
+                      return mainID
+                  }
+                  return (Bundle.main.infoDictionary?["BasePackageIdentifier"] as? String) ?? "io.nekohasekai.sfavt"
+              }()
+
+              public static let resolvedExtensionBundleID: String = {
+                  if let pluginsURL = Bundle.main.builtInPlugInsURL {
+                      let extURL = pluginsURL.appendingPathComponent("Extension.appex", isDirectory: true)
+                      if let extBundle = Bundle(url: extURL),
+                         let extID = extBundle.bundleIdentifier, !extID.isEmpty {
+                          return extID
+                      }
+                  }
+                  return "\\(resolvedPackageName).extension"
+              }()
+
+              private static func provisionedAppGroups() -> [String] {
+                  var urls: [URL] = [Bundle.main.bundleURL.appendingPathComponent("embedded.mobileprovision")]
+                  if Bundle.main.bundleURL.pathExtension == "appex" {
+                      let hostAppURL = Bundle.main.bundleURL.deletingLastPathComponent().deletingLastPathComponent()
+                      urls.append(hostAppURL.appendingPathComponent("embedded.mobileprovision"))
+                  }
+                  for url in urls {
+                      guard let data = try? Data(contentsOf: url),
+                            let raw = String(data: data, encoding: .isoLatin1),
+                            let startRange = raw.range(of: "<?xml"),
+                            let endRange = raw.range(of: "</plist>"),
+                            startRange.lowerBound < endRange.upperBound else {
+                          continue
+                      }
+                      let xmlString = String(raw[startRange.lowerBound..<endRange.upperBound])
+                      guard let xmlData = xmlString.data(using: .utf8),
+                            let plist = try? PropertyListSerialization.propertyList(from: xmlData, options: [], format: nil) as? [String: Any],
+                            let entitlements = plist["Entitlements"] as? [String: Any],
+                            let groups = entitlements["com.apple.security.application-groups"] as? [String],
+                            !groups.isEmpty else {
+                          continue
+                      }
+                      return groups
+                  }
+                  return []
+              }
+
+              public static let resolvedAppGroupID: String = {
+                  var candidates: [String] = []
+                  for group in provisionedAppGroups() {
+                      if group.contains("*") {
+                          candidates.append(group.replacingOccurrences(of: "*", with: resolvedPackageName))
+                      } else {
+                          candidates.append(group)
+                      }
+                  }
+                  candidates.append("group.\\(resolvedPackageName)")
+                  if let infoGroup = Bundle.main.infoDictionary?["AppGroupIdentifier"] as? String, !infoGroup.isEmpty {
+                      candidates.append(infoGroup)
+                  }
+                  var seen = Set<String>()
+                  for candidate in candidates where !candidate.isEmpty {
+                      if seen.insert(candidate).inserted {
+                          if FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: candidate) != nil {
+                              return candidate
+                          }
+                      }
+                  }
+                  return candidates.first ?? "group.\\(resolvedPackageName)"
+              }()
+          }
+          '''
+
+          patched_fp = orig_fp.replace("import Foundation", resolver_code, 1)
+          patched_fp = patched_fp.replace(
+              "public static let packageName = AppConfiguration.packageName",
+              "public static let packageName = ResignRuntimeResolver.resolvedPackageName"
+          )
+          patched_fp = patched_fp.replace(
+              "public static let groupName = AppConfiguration.appGroupID",
+              "public static let groupName = ResignRuntimeResolver.resolvedAppGroupID"
+          )
+          patched_fp = patched_fp.replace(
+              "FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: groupName)",
+              "(FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: groupName) ?? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!)"
+          )
+          filepath_swift.write_text(patched_fp, encoding="utf-8")
+
+          # Also patch providerBundleIdentifier in Library/ if it hardcodes .extension suffix
+          for swift_file in Path("Library").rglob("*.swift"):
+              txt = swift_file.read_text(encoding="utf-8")
+              if "providerBundleIdentifier" in txt and ".extension\"" in txt:
+                  new_txt = re.sub(
+                      r'"\\?\((?:FilePath\.packageName|AppConfiguration\.packageName)\)\.extension"',
+                      'ResignRuntimeResolver.resolvedExtensionBundleID',
+                      txt
+                  )
+                  if new_txt != txt:
+                      swift_file.write_text(new_txt, encoding="utf-8")
+                      print(f"Patched providerBundleIdentifier in {swift_file}")
+          PY
+
+      - name: Compile Unsigned SFI Release App
+        run: |
+          set -euo pipefail
+          cd sing-box-for-apple
+          DERIVED_DATA="$PWD/build/DerivedData"
+          xcodebuild build \
+            -skipPackagePluginValidation \
+            -scheme SFI \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$DERIVED_DATA" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            ENABLE_BITCODE=NO
+
+          APP_SRC="$DERIVED_DATA/Build/Products/Release-iphoneos/sing-box.app"
+          test -d "$APP_SRC"
+          ls -la "$APP_SRC"
+
+      - name: Package Resign-Optimized IPA and Full IPA
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          APP_SRC="sing-box-for-apple/build/DerivedData/Build/Products/Release-iphoneos/sing-box.app"
+          mkdir -p dist
+
+          adhoc_sign_bundle() {
+            local app_dir="$1"
+            rm -rf "$app_dir/SC_Info" "$app_dir/_CodeSignature" "$app_dir/embedded.mobileprovision"
+            find "$app_dir" -name '.DS_Store' -delete
+            if [ -d "$app_dir/Frameworks" ]; then
+              find "$app_dir/Frameworks" -maxdepth 2 \( -name "*.framework" -o -name "*.dylib" \) -print0 | while IFS= read -r -d '' fw; do
+                codesign --force --sign - --timestamp=none "$fw"
+              done
+            fi
+            for dir in PlugIns Extensions; do
+              if [ -d "$app_dir/$dir" ]; then
+                find "$app_dir/$dir" -maxdepth 1 -name "*.appex" -print0 | while IFS= read -r -d '' appex; do
+                  rm -rf "$appex/_CodeSignature" "$appex/embedded.mobileprovision"
+                  if [ -d "$appex/Frameworks" ]; then
+                    find "$appex/Frameworks" -maxdepth 2 \( -name "*.framework" -o -name "*.dylib" \) -print0 | while IFS= read -r -d '' fw; do
+                      codesign --force --sign - --timestamp=none "$fw"
+                    done
+                  fi
+                  codesign --force --sign - --timestamp=none "$appex"
+                done
+              fi
+            done
+            codesign --force --sign - --timestamp=none "$app_dir"
+          }
+
+          # 1. Build Paid-Certificate Resign IPA (Slim: main app + core PacketTunnel Extension.appex only)
+          rm -rf work_resign
+          mkdir -p work_resign/Payload
+          cp -R "$APP_SRC" work_resign/Payload/sing-box.app
+          RESIGN_APP="work_resign/Payload/sing-box.app"
+
+          # Remove Extensions/IntentsExtension.appex (breaks ESign/GBox signature verification) and non-VPN PlugIns
+          rm -rf "$RESIGN_APP/Extensions"
+          if [ -d "$RESIGN_APP/PlugIns" ]; then
+            for item in "$RESIGN_APP/PlugIns"/*.appex; do
+              [ -e "$item" ] || continue
+              if [ "$(basename "$item")" != "Extension.appex" ]; then
+                rm -rf "$item"
+              fi
+            done
+          fi
+          # Remove hardcoded upstream iCloud container from Info.plist
+          /usr/libexec/PlistBuddy -c "Delete :NSUbiquitousContainers" "$RESIGN_APP/Info.plist" 2>/dev/null || true
+
+          adhoc_sign_bundle "$RESIGN_APP"
+          (cd work_resign && ditto -c -k --sequesterRsrc --keepParent Payload "../dist/sing-box-${VERSION}-resign.ipa")
+
+          # 2. Build Full IPA (all extensions preserved)
+          rm -rf work_full
+          mkdir -p work_full/Payload
+          cp -R "$APP_SRC" work_full/Payload/sing-box.app
+          adhoc_sign_bundle "work_full/Payload/sing-box.app"
+          (cd work_full && ditto -c -k --sequesterRsrc --keepParent Payload "../dist/sing-box-${VERSION}-full.ipa")
+
+          ls -lh dist/
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-${{ steps.meta.outputs.version }}-ipa
+          path: dist/*.ipa
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sfi-v${{ steps.meta.outputs.version }}-build.${{ github.run_number }}
+          name: sing-box iOS v${{ steps.meta.outputs.version }} (Paid-Cert Resign Ready)
+          body: |
+            Automated build from official `SagerNet/sing-box` (${{ steps.meta.outputs.tag }}) + `SagerNet/sing-box-for-apple`.
+            - **`sing-box-${{ steps.meta.outputs.version }}-resign.ipa` (Recommended)**: Optimized for 3rd-party paid certificates (ESign 轻松签 / GBox 全能签 / Feather). Keeps core PacketTunnel `Extension.appex`, strips conflicting `IntentsExtension`/`iCloud` containers, and dynamically resolves `AppGroup` & `BundleID` from `embedded.mobileprovision`.
+            - **`sing-box-${{ steps.meta.outputs.version }}-full.ipa`**: Full unmodified bundle with all 6 extensions.
+          files: dist/*.ipa
