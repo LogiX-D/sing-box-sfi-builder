@@ -15,17 +15,8 @@ permissions:
   contents: write
 
 jobs:
-  probe:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "GitHub Actions runner scheduling is active"
-
   build-ipa:
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [macos-15, macos-26-intel]
-    runs-on: ${{ matrix.runner }}
+    runs-on: macos-26-intel
     timeout-minutes: 45
     steps:
       - name: Checkout builder repo
@@ -76,21 +67,32 @@ jobs:
           else
             echo "No exact MARKETING_VERSION commit match; using default branch HEAD"
           fi
+          git submodule update --init --recursive
+          test -f Frameworks/Runestone/Package.swift
+
+      - name: Cache Libbox.xcframework
+        id: cache-libbox
+        uses: actions/cache@v4
+        with:
+          path: sing-box-for-apple/Libbox.xcframework
+          key: libbox-ios-arm64-${{ steps.meta.outputs.tag }}
 
       - name: Setup Go Toolchain
+        if: steps.cache-libbox.outputs.cache-hit != 'true'
         uses: actions/setup-go@v5
         with:
           go-version-file: sing-box/go.mod
           cache: false
 
-      - name: Build Libbox.xcframework (iOS only for speed, fallback to full apple)
+      - name: Build Libbox.xcframework
+        if: steps.cache-libbox.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           export PATH="$(go env GOPATH)/bin:$PATH"
           cd sing-box
           make lib_install
           if go run ./cmd/internal/build_libbox -h 2>&1 | grep -q -- "-platform"; then
-            go run ./cmd/internal/build_libbox -target apple -platform ios
+            go run ./cmd/internal/build_libbox -target apple -platform ios/arm64
           else
             make lib_apple
           fi
@@ -354,16 +356,16 @@ jobs:
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: sing-box-${{ steps.meta.outputs.version }}-ipa-${{ matrix.runner }}
+          name: sing-box-${{ steps.meta.outputs.version }}-ipa
           path: dist/*.ipa
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: sfi-v${{ steps.meta.outputs.version }}-${{ matrix.runner }}-build.${{ github.run_number }}
-          name: sing-box iOS v${{ steps.meta.outputs.version }} (${{ matrix.runner }} Paid-Cert Resign Ready)
+          tag_name: sfi-v${{ steps.meta.outputs.version }}-build.${{ github.run_number }}
+          name: sing-box iOS v${{ steps.meta.outputs.version }} (Paid-Cert Resign Ready)
           body: |
-            Automated build from official `SagerNet/sing-box` (${{ steps.meta.outputs.tag }}) + `SagerNet/sing-box-for-apple` on `${{ matrix.runner }}`.
-            - **`sing-box-${{ steps.meta.outputs.version }}-resign.ipa` (Recommended)**: Optimized for 3rd-party paid certificates (ESign 轻松签 / GBox 全能签 / Feather).
+            Automated build from official `SagerNet/sing-box` (${{ steps.meta.outputs.tag }}) + `SagerNet/sing-box-for-apple`.
+            - **`sing-box-${{ steps.meta.outputs.version }}-resign.ipa` (Recommended)**: Optimized for 3rd-party paid certificates (ESign 轻松签 / GBox 全能签 / Feather). Keeps core PacketTunnel `Extension.appex`, strips conflicting `IntentsExtension`/`iCloud` containers, and dynamically resolves `AppGroup` & `BundleID` from `embedded.mobileprovision`.
             - **`sing-box-${{ steps.meta.outputs.version }}-full.ipa`**: Full unmodified bundle with all 6 extensions.
           files: dist/*.ipa
